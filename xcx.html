@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>小游戏 1.5.6 - 怪物防重叠优化版</title>
+    <style>
+        :root { --blue: #00f3ff; --pink: #ff0055; --green: #39ff14; --orange: #ffaa00; --gold: #ffcc00; --bg: #0a0b12; }
+        body { margin: 0; background: #000; color: #fff; font-family: 'Microsoft YaHei', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        
+        #dashboard {
+            width: 1000px; background: #111; border: 1px solid #333; border-bottom: none;
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 20px; box-sizing: border-box;
+        }
+        .info-group { display: flex; gap: 20px; align-items: center; }
+        .info-item { font-size: 14px; font-weight: bold; color: var(--blue); }
+        .cd-bar-wrap { width: 100px; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }
+        #cd-bar { width: 0%; height: 100%; background: var(--green); }
+        #freeze-status { color: var(--gold); font-weight: 900; visibility: hidden; }
+
+        #viewport { position: relative; width: 1000px; height: 600px; background: var(--bg); border: 1px solid #333; }
+        canvas { display: block; }
+
+        .overlay { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; background: rgba(5, 6, 8, 0.95); z-index: 100; }
+        #menu-layer { display: flex; }
+        h1 { font-size: 32px; color: var(--blue); margin: 0 0 20px 0; }
+        .btn { width: 140px; padding: 10px; margin: 5px; background: transparent; border: 1px solid #555; color: #fff; cursor: pointer; font-size: 14px; }
+        .btn.active { border-color: var(--green); color: var(--green); background: rgba(57, 255, 20, 0.1); }
+        .btn:hover:not(.active) { background: var(--blue); color: #000; border-color: var(--blue); }
+
+        #death-screen { position: absolute; inset: 0; display: none; background: rgba(255, 0, 0, 0.2); border: 8px solid var(--pink); z-index: 150; pointer-events: none; }
+        #death-text { position: absolute; top: 40%; width: 100%; text-align: center; font-size: 36px; font-weight: 900; color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div id="dashboard">
+        <div class="info-group">
+            <div id="val-diff" class="info-item">难度: ---</div>
+            <div id="val-steps" class="info-item">步数: 0</div>
+            <div class="info-item">飞镖: <div class="cd-bar-wrap"><div id="cd-bar"></div></div></div>
+        </div>
+        <div id="freeze-status">已定身: 5.0s</div>
+        <div style="font-size: 12px; color: #888;"><b>Space</b> 暂停 | <b>J/K</b> 炸弹 | <b>L</b> 飞镖 | <b>金色方块</b>定身</div>
+    </div>
+
+    <div id="viewport">
+        <canvas id="gameCanvas" width="1000" height="600"></canvas>
+        <div id="death-screen"><div id="death-text"></div></div>
+
+        <div id="menu-layer" class="overlay">
+            <h1>生存小游戏 1.5.6</h1>
+            <div style="margin-bottom:15px">
+                <button id="mode-std" class="btn active" onclick="setMapType('std')">标准地图</button>
+                <button id="mode-plain" class="btn" onclick="setMapType('plain')">平原模式</button>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                <button class="btn" onclick="start(1)">和平</button>
+                <button class="btn" onclick="start(2)">简单</button>
+                <button class="btn" onclick="start(3)">普通</button>
+                <button class="btn" onclick="start(4)">困难</button>
+                <button class="btn" style="border-color:var(--pink)" onclick="start(5)">地狱</button>
+            </div>
+        </div>
+
+        <div id="pause-layer" class="overlay"><h2>暂停</h2></div>
+        <div id="result-layer" class="overlay"><h2 id="res-title"></h2><p id="res-desc"></p></div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas'), ctx = canvas.getContext('2d');
+    const TILE = 20, COLS = canvas.width / TILE, ROWS = canvas.height / TILE;
+
+    let gameState = 'MENU', mapType = 'std', diff = 1;
+    let map = [], zombies = [], bombs = [], explosions = [], projectiles = [], items = [];
+    let player = { x: 1, y: 1, dx: 0, dy: 1 };
+    let steps = 0, zombieTick = 0, heatmap = [], dartCD = 0, freezeTimer = 0;
+    
+    const VIEW_DIST = 25, DART_CD_MAX = 35; 
+
+    function setMapType(type) {
+        mapType = type;
+        document.getElementById('mode-std').classList.toggle('active', type === 'std');
+        document.getElementById('mode-plain').classList.toggle('active', type === 'plain');
+    }
+
+    function start(d) {
+        diff = d; gameState = 'PLAYING'; steps = 0; dartCD = 0; freezeTimer = 0;
+        zombies = []; bombs = []; explosions = []; projectiles = []; items = [];
+        document.getElementById('menu-layer').style.display = 'none';
+        document.getElementById('result-layer').style.display = 'none';
+        document.getElementById('val-diff').innerText = '难度: ' + ['','和平','简单','普通','困难','地狱'][d];
+        generateMap();
+        player = { x: 1, y: 1, dx: 0, dy: 1 };
+        updateHeatmap();
+        requestAnimationFrame(gameLoop);
+    }
+
+    function generateMap() {
+        map = Array.from({length: ROWS}, () => Array(COLS).fill(1));
+        const rate = (mapType === 'plain') ? 0 : [0, 0, 0.08, 0.1, 0.12, 0.14][diff];
+        for(let y=1; y<ROWS-1; y++) for(let x=1; x<COLS-1; x++) if(Math.random() > rate) map[y][x] = 0;
+        for(let x=1; x<=COLS-2; x++) map[1][x] = 0;
+        for(let y=1; y<=ROWS-2; y++) map[y][COLS-2] = 0;
+
+        const zCount = (mapType === 'plain') ? diff * 30 : diff * 12;
+        for(let i=0; i<zCount; i++) {
+            let rx, ry, tries = 0;
+            do {
+                rx = Math.floor(Math.random()*(COLS-2))+1;
+                ry = Math.floor(Math.random()*(ROWS-2))+1;
+                tries++;
+            } while((map[ry][rx] === 1 || Math.abs(rx-1)+Math.abs(ry-1) < 10 || isOccupied(rx, ry)) && tries < 50);
+            
+            if(tries < 50) {
+                let type = 'normal';
+                if(diff === 5 && Math.random() < 0.18) type = 'splitter';
+                if(diff >= 4 && Math.random() < 0.08) type = 'ranged';
+                zombies.push({x:rx, y:ry, type, shootCD: 50 + Math.random()*100});
+            }
+        }
+
+        for(let i=0; i<2; i++) {
+            let rx, ry;
+            do {
+                rx = Math.floor(Math.random()*(COLS-2))+1;
+                ry = Math.floor(Math.random()*(ROWS-2))+1;
+            } while(map[ry][rx] === 1 || Math.abs(rx-1)+Math.abs(ry-1) < 15);
+            items.push({x: rx, y: ry, type: 'freeze'});
+        }
+    }
+
+    function isOccupied(x, y) {
+        return zombies.some(z => z.x === x && z.y === y);
+    }
+
+    function updateHeatmap() {
+        heatmap = Array.from({length: ROWS}, () => Array(COLS).fill(999));
+        let q = [{x: player.x, y: player.y, d: 0}]; heatmap[player.y][player.x] = 0;
+        while(q.length) {
+            let {x, y, d} = q.shift();
+            for(let dir of [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}]) {
+                let nx = x + dir.x, ny = y + dir.y;
+                if(nx>=0 && nx<COLS && ny>=0 && ny<ROWS && map[ny][nx]===0 && heatmap[ny][nx] === 999) {
+                    heatmap[ny][nx] = d + 1; q.push({x: nx, y: ny, d: d + 1});
+                }
+            }
+        }
+    }
+
+    function gameLoop() {
+        if(gameState === 'PAUSED' || gameState === 'OVER' || gameState === 'MENU') return;
+        update(); draw(); requestAnimationFrame(gameLoop);
+    }
+
+    function update() {
+        if(gameState !== 'PLAYING') return;
+
+        if(dartCD > 0) { dartCD--; document.getElementById('cd-bar').style.width = (dartCD/DART_CD_MAX*100)+'%'; }
+        if(freezeTimer > 0) {
+            freezeTimer--;
+            document.getElementById('freeze-status').style.visibility = 'visible';
+            document.getElementById('freeze-status').innerText = `已定身: ${(freezeTimer/60).toFixed(1)}s`;
+        } else {
+            document.getElementById('freeze-status').style.visibility = 'hidden';
+        }
+
+        zombieTick++;
+        const speedLimit = [0, 0, 60, 45, 38, 28][diff];
+        
+        zombies.forEach((z) => {
+            const dist = Math.abs(z.x - player.x) + Math.abs(z.y - player.y);
+            if(freezeTimer <= 0 && dist <= VIEW_DIST) {
+                if(zombieTick > speedLimit) {
+                    let move = true;
+                    if(z.type === 'ranged' && dist < 10) move = false; 
+                    if(move) {
+                        let best = {x: z.x, y: z.y, val: heatmap[z.y][z.x]};
+                        let options = [];
+                        for(let d of [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}]) {
+                            let nx = z.x + d.x, ny = z.y + d.y;
+                            if(nx>=0 && nx<COLS && ny>=0 && ny<ROWS && map[ny][nx]===0) {
+                                options.push({x: nx, y: ny, val: heatmap[ny][nx]});
+                            }
+                        }
+                        options.sort((a,b) => a.val - b.val);
+                        for(let opt of options) {
+                            if(!isOccupied(opt.x, opt.y) && opt.val < heatmap[z.y][z.x]) {
+                                z.x = opt.x; z.y = opt.y;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if(z.type === 'ranged') {
+                    z.shootCD--;
+                    if(z.shootCD <= 0) {
+                        const angle = Math.atan2(player.y - z.y, player.x - z.x);
+                        projectiles.push({x: z.x, y: z.y, vx: Math.cos(angle)*0.35, vy: Math.sin(angle)*0.35, owner: 'enemy'});
+                        z.shootCD = 180 + Math.random()*150;
+                    }
+                }
+            }
+            if(Math.abs(z.x - player.x) < 0.5 && Math.abs(z.y - player.y) < 0.5) endGame("被抓住了", false);
+        });
+        if(zombieTick > speedLimit) zombieTick = 0;
+
+        items = items.filter(it => {
+            if(it.x === player.x && it.y === player.y) {
+                if(it.type === 'freeze') freezeTimer = 300;
+                return false;
+            }
+            return true;
+        });
+
+        bombs = bombs.filter(b => {
+            if(--b.t <= 0) { triggerExplosion(b.x, b.y, b.type); return false; }
+            return true;
+        });
+
+        projectiles = projectiles.filter(p => {
+            p.x += p.vx; p.y += p.vy;
+            let mx = Math.round(p.x), my = Math.round(p.y);
+            if(mx<0 || mx>=COLS || my<0 || my>=ROWS || map[my][mx] === 1) return false;
+            if(p.owner === 'player') {
+                let hitIdx = zombies.findIndex(z => Math.abs(z.x - p.x) < 0.8 && Math.abs(z.y - p.y) < 0.8);
+                if(hitIdx !== -1) { killZombie(hitIdx); return false; }
+            } else {
+                if(Math.abs(player.x - p.x) < 0.6 && Math.abs(player.y - p.y) < 0.6) endGame("被射中了", false);
+            }
+            return true;
+        });
+        explosions = explosions.filter(e => --e.life > 0);
+    }
+
+    function killZombie(idx) {
+        const z = zombies[idx];
+        if(z.type === 'splitter') {
+            // 分裂时寻找邻近空位
+            let pos = [{x:1,y:0}, {x:-1,y:0}, {x:0,y:1}, {x:0,y:-1}];
+            for(let i=0; i<2; i++) {
+                let p = pos[i];
+                let nx = z.x + p.x, ny = z.y + p.y;
+                if(map[ny] && map[ny][nx] === 0 && !isOccupied(nx, ny)) {
+                    zombies.push({x: nx, y: ny, type: 'mini'});
+                } else {
+                    zombies.push({x: z.x, y: z.y, type: 'mini'}); // 实在没位子再重叠
+                }
+            }
+        }
+        zombies.splice(idx, 1);
+    }
+
+    function triggerExplosion(cx, cy, type) {
+        let cells = [];
+        if(type === 'cross') {
+            [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}].forEach(d => {
+                for(let s=0; s<12; s++) {
+                    let nx = cx+d.x*s, ny = cy+d.y*s;
+                    if(nx<0 || nx>=COLS || ny<0 || ny>=ROWS || map[ny][nx] === 1) break;
+                    cells.push({x:nx, y:ny});
+                }
+            });
+        } else {
+            for(let dy=-2; dy<=2; dy++) for(let dx=-2; dx<=2; dx++) {
+                let nx=cx+dx, ny=cy+dy;
+                if(nx>0 && nx<COLS-1 && ny>0 && ny<ROWS-1 && dx*dx+dy*dy<=5 && map[ny][nx]===0) cells.push({x:nx, y:ny});
+            }
+        }
+        explosions.push({cells, life: 10});
+        cells.forEach(c => {
+            if(c.x === player.x && c.y === player.y) endGame("自爆了", false);
+            for(let i = zombies.length-1; i>=0; i--) {
+                if(zombies[i].x === c.x && zombies[i].y === c.y) killZombie(i);
+            }
+        });
+    }
+
+    function draw() {
+        ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#1c1e2d';
+        for(let y=0; y<ROWS; y++) for(let x=0; x<COLS; x++) if(map[y][x] === 1) ctx.fillRect(x*TILE, y*TILE, TILE-1, TILE-1);
+        items.forEach(it => {
+            ctx.fillStyle = (Date.now() % 400 < 200) ? varColor('--gold') : '#fff';
+            ctx.fillRect(it.x*TILE+4, it.y*TILE+4, TILE-8, TILE-8);
+        });
+        ctx.fillStyle = varColor('--pink'); ctx.fillRect((COLS-2)*TILE+2, (ROWS-2)*TILE+2, TILE-4, TILE-4);
+        ctx.fillStyle = 'rgba(255, 120, 0, 0.4)';
+        explosions.forEach(e => e.cells.forEach(c => ctx.fillRect(c.x*TILE, c.y*TILE, TILE, TILE)));
+        bombs.forEach(b => {
+            ctx.fillStyle = b.t % 10 < 5 ? '#ff0' : '#f00';
+            ctx.beginPath(); ctx.arc(b.x*TILE+TILE/2, b.y*TILE+TILE/2, TILE/3, 0, 7); ctx.fill();
+        });
+        projectiles.forEach(p => {
+            ctx.fillStyle = p.owner === 'player' ? '#fff' : varColor('--orange');
+            ctx.fillRect(p.x*TILE+8, p.y*TILE+8, 4, 4);
+        });
+        zombies.forEach(z => {
+            const dist = Math.abs(z.x - player.x) + Math.abs(z.y - player.y);
+            if(freezeTimer > 0) ctx.fillStyle = '#444';
+            else if(z.type === 'splitter') ctx.fillStyle = varColor('--green');
+            else if(z.type === 'ranged') ctx.fillStyle = varColor('--orange');
+            else if(z.type === 'mini') ctx.fillStyle = '#ff00ff';
+            else ctx.fillStyle = (dist <= VIEW_DIST) ? '#b026ff' : '#4a106e';
+            const size = z.type === 'mini' ? 10 : 14;
+            const offset = (20 - size) / 2;
+            ctx.fillRect(z.x*TILE+offset, z.y*TILE+offset, size, size);
+        });
+        ctx.fillStyle = varColor('--blue'); ctx.fillRect(player.x*TILE+2, player.y*TILE+2, TILE-4, TILE-4);
+    }
+
+    window.addEventListener('keydown', e => {
+        const k = e.key.toLowerCase();
+        if(e.code === 'Space') {
+            if(gameState === 'PLAYING') { gameState = 'PAUSED'; document.getElementById('pause-layer').style.display='flex'; }
+            else if(gameState === 'PAUSED') { gameState = 'PLAYING'; document.getElementById('pause-layer').style.display='none'; requestAnimationFrame(gameLoop); }
+            return;
+        }
+        if(gameState !== 'PLAYING') return;
+        let nx = player.x, ny = player.y;
+        if(k === 'w') { ny--; player.dx=0; player.dy=-1; }
+        else if(k === 's') { ny++; player.dx=0; player.dy=1; }
+        else if(k === 'a') { nx--; player.dx=-1; player.dy=0; }
+        else if(k === 'd') { nx++; player.dx=1; player.dy=0; }
+        if(map[ny] && map[ny][nx] === 0) {
+            player.x = nx; player.y = ny; steps++; updateHeatmap();
+            document.getElementById('val-steps').innerText = '步数: ' + steps;
+            if(player.x === COLS-2 && player.y === ROWS-2) endGame("撤离成功", true);
+        }
+        if(k === 'j') bombs.push({x: player.x, y: player.y, t: 50, type: 'cross'});
+        if(k === 'k') bombs.push({x: player.x, y: player.y, t: 50, type: 'circle'});
+        if(k === 'l' && dartCD <= 0) {
+            projectiles.push({x: player.x, y: player.y, vx: player.dx*0.75, vy: player.dy*0.75, owner: 'player'});
+            dartCD = DART_CD_MAX;
+        }
+    });
+
+    function endGame(txt, win) {
+        if(gameState === 'DYING') return;
+        gameState = 'DYING'; 
+        if(!win) { document.getElementById('death-text').innerText = txt; document.getElementById('death-screen').style.display='block'; }
+        setTimeout(() => {
+            gameState = 'OVER'; document.getElementById('death-screen').style.display = 'none';
+            document.getElementById('result-layer').style.display = 'flex';
+            document.getElementById('res-title').innerText = win ? "成功" : "失败";
+            document.getElementById('res-desc').innerText = win ? `步数: ${steps}` : txt;
+            setTimeout(() => { document.getElementById('result-layer').style.display = 'none'; document.getElementById('menu-layer').style.display = 'flex'; gameState = 'MENU'; }, 2000);
+        }, win ? 500 : 1500);
+    }
+    function varColor(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+</script>
+</body>
+</html>
